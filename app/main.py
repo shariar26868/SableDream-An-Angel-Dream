@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.database import connect_db, close_db
-from app.routes import auth, chat
+from app.routes import chat
 
 
 @asynccontextmanager
@@ -15,7 +15,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Sable Dreams API",
-    description="Your personal AI companion. One chat endpoint — Sable handles everything.",
+    description="Your personal AI companion. Just send a message — Sable handles everything.",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -28,17 +28,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {
-        "message": "Sable Dreams API ✨",
-        "version": "2.0.0",
-        "docs": "/docs",
-    }
+    return {"message": "Sable Dreams API ✨", "docs": "/docs"}
 
 
 @app.get("/health", tags=["Health"])

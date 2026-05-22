@@ -1,16 +1,15 @@
 import asyncio
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, status
 from app.models.chat import (
     ChatRequest, ChatResponse,
     SessionSummary, SessionDetail,
-    Message, MessageRole,
+    MessageRole,
 )
 from app.services.sable_ai import (
     get_sable_response,
     extract_memory,
     generate_session_title,
 )
-from app.dependencies import get_current_user
 from app.database import get_db
 from bson import ObjectId
 from datetime import datetime
@@ -20,11 +19,7 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 
 
 def _merge_memory(existing: dict, extracted) -> dict:
-    """
-    Merge newly extracted memory into the user's persistent memory document.
-    Lists are deduplicated and capped to avoid unbounded growth.
-    """
-    CAP = 50  # max items per list
+    CAP = 50
 
     def merge_list(key: str, new_items: list):
         current = existing.get(key, [])
@@ -53,30 +48,23 @@ def _merge_memory(existing: dict, extracted) -> dict:
 
 # ── POST /chat/message ─────────────────────────────────────────────────────────
 @router.post("/message", response_model=ChatResponse)
-async def send_message(
-    request: ChatRequest,
-    current_user: dict = Depends(get_current_user),
-):
+async def send_message(request: ChatRequest):
     db = get_db()
-    user_id = str(current_user["_id"])
-    user_name = current_user.get("name", "friend")
     now = datetime.utcnow()
 
-    # ── 1. Resolve or create session ──────────────────────────────────────────
+    # ── Resolve or create session ──────────────────────────────────────────────
     if request.session_id:
-        session = await db.chat_sessions.find_one({
-            "_id": ObjectId(request.session_id),
-            "user_id": user_id,
-        })
+        session = await db.chat_sessions.find_one({"_id": ObjectId(request.session_id)})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         session_id = request.session_id
         raw_history = session.get("messages", [])
+        # Use the session's memory_key to load memory
+        memory_key = session.get("memory_key", request.session_id)
     else:
-        # New session — title generated from first message
+        # New session
         title = await generate_session_title(request.message)
         result = await db.chat_sessions.insert_one({
-            "user_id": user_id,
             "title": title,
             "messages": [],
             "created_at": now,
@@ -84,11 +72,18 @@ async def send_message(
         })
         session_id = str(result.inserted_id)
         raw_history = []
+        memory_key = session_id
 
-    # ── 2. Load user's persistent memory ──────────────────────────────────────
-    memory_doc = await db.user_memory.find_one({"user_id": user_id}) or {}
+        # Store memory_key on session
+        await db.chat_sessions.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {"memory_key": memory_key}}
+        )
 
-    # ── 3. Run memory extraction + Sable response in parallel ─────────────────
+    # ── Load persistent memory for this session ────────────────────────────────
+    memory_doc = await db.session_memory.find_one({"memory_key": memory_key}) or {}
+
+    # ── Run extraction + Sable response in parallel ────────────────────────────
     openai_history = [
         {"role": m["role"], "content": m["content"]}
         for m in raw_history
@@ -99,23 +94,23 @@ async def send_message(
         get_sable_response(
             user_message=request.message,
             conversation_history=openai_history,
-            user_name=user_name,
+            user_name="friend",
             user_memory=memory_doc,
         ),
     )
 
-    # ── 4. Persist updated memory ──────────────────────────────────────────────
+    # ── Persist updated memory ─────────────────────────────────────────────────
     updated_memory = _merge_memory(dict(memory_doc), extracted)
-    updated_memory["user_id"] = user_id
+    updated_memory["memory_key"] = memory_key
     updated_memory["updated_at"] = now
 
-    await db.user_memory.update_one(
-        {"user_id": user_id},
+    await db.session_memory.update_one(
+        {"memory_key": memory_key},
         {"$set": updated_memory},
         upsert=True,
     )
 
-    # ── 5. Save both messages to session ──────────────────────────────────────
+    # ── Save messages to session ───────────────────────────────────────────────
     user_msg = {
         "role": MessageRole.USER,
         "content": request.message,
@@ -145,14 +140,9 @@ async def send_message(
 
 # ── GET /chat/sessions ─────────────────────────────────────────────────────────
 @router.get("/sessions", response_model=List[SessionSummary])
-async def list_sessions(current_user: dict = Depends(get_current_user)):
-    """All sessions for the user, newest first."""
+async def list_sessions():
     db = get_db()
-    user_id = str(current_user["_id"])
-
-    sessions = await db.chat_sessions.find(
-        {"user_id": user_id}
-    ).sort("updated_at", -1).to_list(100)
+    sessions = await db.chat_sessions.find().sort("updated_at", -1).to_list(100)
 
     result = []
     for s in sessions:
@@ -172,24 +162,14 @@ async def list_sessions(current_user: dict = Depends(get_current_user)):
 
 # ── GET /chat/sessions/{id} ────────────────────────────────────────────────────
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
-async def get_session(
-    session_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Full conversation history for a session."""
+async def get_session(session_id: str):
     db = get_db()
-    user_id = str(current_user["_id"])
-
-    session = await db.chat_sessions.find_one({
-        "_id": ObjectId(session_id),
-        "user_id": user_id,
-    })
+    session = await db.chat_sessions.find_one({"_id": ObjectId(session_id)})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     return SessionDetail(
         id=str(session["_id"]),
-        user_id=session["user_id"],
         title=session.get("title", "Untitled"),
         messages=session.get("messages", []),
         created_at=session["created_at"],
@@ -197,37 +177,27 @@ async def get_session(
     )
 
 
-# ── GET /chat/memory ───────────────────────────────────────────────────────────
-@router.get("/memory")
-async def get_memory(current_user: dict = Depends(get_current_user)):
-    """
-    See everything Sable has learned about you from your conversations.
-    Useful for debugging or showing the user their own profile.
-    """
+# ── GET /chat/sessions/{id}/memory ────────────────────────────────────────────
+@router.get("/sessions/{session_id}/memory")
+async def get_session_memory(session_id: str):
+    """See everything Sable has learned from this session's conversations."""
     db = get_db()
-    user_id = str(current_user["_id"])
-
-    memory = await db.user_memory.find_one({"user_id": user_id})
+    memory = await db.session_memory.find_one({"memory_key": session_id})
     if not memory:
         return {"message": "No memory yet. Start chatting with Sable!"}
 
     memory.pop("_id", None)
-    memory.pop("user_id", None)
+    memory.pop("memory_key", None)
     return memory
 
 
 # ── DELETE /chat/sessions/{id} ────────────────────────────────────────────────
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(
-    session_id: str,
-    current_user: dict = Depends(get_current_user),
-):
+async def delete_session(session_id: str):
     db = get_db()
-    user_id = str(current_user["_id"])
-
-    result = await db.chat_sessions.delete_one({
-        "_id": ObjectId(session_id),
-        "user_id": user_id,
-    })
+    result = await db.chat_sessions.delete_one({"_id": ObjectId(session_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Clean up memory too
+    await db.session_memory.delete_one({"memory_key": session_id})
