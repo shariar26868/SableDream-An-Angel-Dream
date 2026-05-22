@@ -2,16 +2,14 @@ import asyncio
 from fastapi import APIRouter, HTTPException, status
 from app.models.chat import (
     ChatRequest, ChatResponse,
-    SessionSummary, SessionDetail,
+    ConversationDetail,
     MessageRole,
 )
 from app.services.sable_ai import (
     get_sable_response,
     extract_memory,
-    generate_session_title,
 )
 from app.database import get_db
-from bson import ObjectId
 from datetime import datetime
 from typing import List
 
@@ -52,44 +50,25 @@ async def send_message(request: ChatRequest):
     db = get_db()
     now = datetime.utcnow()
 
-    # ── Resolve or create session ──────────────────────────────────────────────
-    if request.session_id:
-        # Validate that session_id is a proper ObjectId before querying
-        if not ObjectId.is_valid(request.session_id):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid session_id format. Leave it empty to start a new session."
-            )
-        session = await db.chat_sessions.find_one({"_id": ObjectId(request.session_id)})
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        session_id = request.session_id
-        raw_history = session.get("messages", [])
-        # Use the session's memory_key to load memory
-        memory_key = session.get("memory_key", request.session_id)
+    # ── Load or create conversation for this user ──────────────────────────────
+    conversation = await db.conversations.find_one({"user_id": request.user_id})
+
+    if conversation:
+        raw_history = conversation.get("messages", [])
     else:
-        # New session
-        title = await generate_session_title(request.message)
-        result = await db.chat_sessions.insert_one({
-            "title": title,
+        # First time this user is chatting — create their conversation doc
+        await db.conversations.insert_one({
+            "user_id": request.user_id,
             "messages": [],
             "created_at": now,
             "updated_at": now,
         })
-        session_id = str(result.inserted_id)
         raw_history = []
-        memory_key = session_id
 
-        # Store memory_key on session
-        await db.chat_sessions.update_one(
-            {"_id": result.inserted_id},
-            {"$set": {"memory_key": memory_key}}
-        )
+    # ── Load this user's persistent memory ────────────────────────────────────
+    memory_doc = await db.user_memory.find_one({"user_id": request.user_id}) or {}
 
-    # ── Load persistent memory for this session ────────────────────────────────
-    memory_doc = await db.session_memory.find_one({"memory_key": memory_key}) or {}
-
-    # ── Run extraction + Sable response in parallel ────────────────────────────
+    # ── Run memory extraction + Sable response in parallel ────────────────────
     openai_history = [
         {"role": m["role"], "content": m["content"]}
         for m in raw_history
@@ -100,23 +79,23 @@ async def send_message(request: ChatRequest):
         get_sable_response(
             user_message=request.message,
             conversation_history=openai_history,
-            user_name="friend",
+            user_name=request.user_id,
             user_memory=memory_doc,
         ),
     )
 
     # ── Persist updated memory ─────────────────────────────────────────────────
     updated_memory = _merge_memory(dict(memory_doc), extracted)
-    updated_memory["memory_key"] = memory_key
+    updated_memory["user_id"] = request.user_id
     updated_memory["updated_at"] = now
 
-    await db.session_memory.update_one(
-        {"memory_key": memory_key},
+    await db.user_memory.update_one(
+        {"user_id": request.user_id},
         {"$set": updated_memory},
         upsert=True,
     )
 
-    # ── Save messages to session ───────────────────────────────────────────────
+    # ── Save both messages to conversation ────────────────────────────────────
     user_msg = {
         "role": MessageRole.USER,
         "content": request.message,
@@ -129,8 +108,8 @@ async def send_message(request: ChatRequest):
         "timestamp": now,
     }
 
-    await db.chat_sessions.update_one(
-        {"_id": ObjectId(session_id)},
+    await db.conversations.update_one(
+        {"user_id": request.user_id},
         {
             "$push": {"messages": {"$each": [user_msg, assistant_msg]}},
             "$set": {"updated_at": now},
@@ -138,78 +117,50 @@ async def send_message(request: ChatRequest):
     )
 
     return ChatResponse(
-        session_id=session_id,
+        user_id=request.user_id,
         reply=sable_reply,
         timestamp=now,
     )
 
 
-# ── GET /chat/sessions ─────────────────────────────────────────────────────────
-@router.get("/sessions", response_model=List[SessionSummary])
-async def list_sessions():
+# ── GET /chat/history/{user_id} ───────────────────────────────────────────────
+@router.get("/history/{user_id}", response_model=ConversationDetail)
+async def get_history(user_id: str):
+    """Get full conversation history for a user."""
     db = get_db()
-    sessions = await db.chat_sessions.find().sort("updated_at", -1).to_list(100)
+    conversation = await db.conversations.find_one({"user_id": user_id})
+    if not conversation:
+        raise HTTPException(status_code=404, detail="No conversation found for this user")
 
-    result = []
-    for s in sessions:
-        msgs = s.get("messages", [])
-        last = msgs[-1]["content"] if msgs else None
-        result.append(SessionSummary(
-            id=str(s["_id"]),
-            title=s.get("title", "Untitled"),
-            last_message=last[:120] if last else None,
-            message_count=len(msgs),
-            created_at=s["created_at"],
-            updated_at=s["updated_at"],
-        ))
-
-    return result
-
-
-# ── GET /chat/sessions/{id} ────────────────────────────────────────────────────
-@router.get("/sessions/{session_id}", response_model=SessionDetail)
-async def get_session(session_id: str):
-    db = get_db()
-    if not ObjectId.is_valid(session_id):
-        raise HTTPException(status_code=400, detail="Invalid session_id format")
-    session = await db.chat_sessions.find_one({"_id": ObjectId(session_id)})
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    return SessionDetail(
-        id=str(session["_id"]),
-        title=session.get("title", "Untitled"),
-        messages=session.get("messages", []),
-        created_at=session["created_at"],
-        updated_at=session["updated_at"],
+    return ConversationDetail(
+        user_id=conversation["user_id"],
+        messages=conversation.get("messages", []),
+        created_at=conversation["created_at"],
+        updated_at=conversation["updated_at"],
     )
 
 
-# ── GET /chat/sessions/{id}/memory ────────────────────────────────────────────
-@router.get("/sessions/{session_id}/memory")
-async def get_session_memory(session_id: str):
-    """See everything Sable has learned from this session's conversations."""
+# ── GET /chat/memory/{user_id} ────────────────────────────────────────────────
+@router.get("/memory/{user_id}")
+async def get_memory(user_id: str):
+    """See everything Sable has learned about this user."""
     db = get_db()
-    if not ObjectId.is_valid(session_id):
-        raise HTTPException(status_code=400, detail="Invalid session_id format")
-    memory = await db.session_memory.find_one({"memory_key": session_id})
+    memory = await db.user_memory.find_one({"user_id": user_id})
     if not memory:
         return {"message": "No memory yet. Start chatting with Sable!"}
 
     memory.pop("_id", None)
-    memory.pop("memory_key", None)
+    memory.pop("user_id", None)
     return memory
 
 
-# ── DELETE /chat/sessions/{id} ────────────────────────────────────────────────
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(session_id: str):
+# ── DELETE /chat/history/{user_id} ───────────────────────────────────────────
+@router.delete("/history/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_history(user_id: str):
+    """Delete a user's full conversation history and memory."""
     db = get_db()
-    if not ObjectId.is_valid(session_id):
-        raise HTTPException(status_code=400, detail="Invalid session_id format")
-    result = await db.chat_sessions.delete_one({"_id": ObjectId(session_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Session not found")
+    conv_result = await db.conversations.delete_one({"user_id": user_id})
+    if conv_result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="No conversation found for this user")
 
-    # Clean up memory too
-    await db.session_memory.delete_one({"memory_key": session_id})
+    await db.user_memory.delete_one({"user_id": user_id})

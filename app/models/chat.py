@@ -28,28 +28,18 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=200)
     message: str = Field(..., min_length=1, max_length=4000)
-    session_id: Optional[str] = None  # None = auto-create new session
 
 
 class ChatResponse(BaseModel):
-    session_id: str
+    user_id: str
     reply: str
     timestamp: datetime
 
 
-class SessionSummary(BaseModel):
-    id: str
-    title: str
-    last_message: Optional[str] = None
-    message_count: int
-    created_at: datetime
-    updated_at: datetime
-
-
-class SessionDetail(BaseModel):
-    id: str
-    title: str
+class ConversationDetail(BaseModel):
+    user_id: str
     messages: List[Message] = []
     created_at: datetime
     updated_at: datetime

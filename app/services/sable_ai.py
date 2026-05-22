@@ -156,21 +156,4 @@ async def get_sable_response(
     return response.choices[0].message.content
 
 
-async def generate_session_title(first_message: str) -> str:
-    """Auto-generate a short session title from the first message."""
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Generate a very short (3-6 words) title for a chat session based on the user's message. Return only the title, nothing else, no quotes.",
-                },
-                {"role": "user", "content": first_message},
-            ],
-            max_tokens=20,
-            temperature=0.5,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return "New Conversation"
+
