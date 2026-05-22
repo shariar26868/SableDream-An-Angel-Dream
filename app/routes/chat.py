@@ -54,6 +54,12 @@ async def send_message(request: ChatRequest):
 
     # ── Resolve or create session ──────────────────────────────────────────────
     if request.session_id:
+        # Validate that session_id is a proper ObjectId before querying
+        if not ObjectId.is_valid(request.session_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid session_id format. Leave it empty to start a new session."
+            )
         session = await db.chat_sessions.find_one({"_id": ObjectId(request.session_id)})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -164,6 +170,8 @@ async def list_sessions():
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
 async def get_session(session_id: str):
     db = get_db()
+    if not ObjectId.is_valid(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
     session = await db.chat_sessions.find_one({"_id": ObjectId(session_id)})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -182,6 +190,8 @@ async def get_session(session_id: str):
 async def get_session_memory(session_id: str):
     """See everything Sable has learned from this session's conversations."""
     db = get_db()
+    if not ObjectId.is_valid(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
     memory = await db.session_memory.find_one({"memory_key": session_id})
     if not memory:
         return {"message": "No memory yet. Start chatting with Sable!"}
@@ -195,6 +205,8 @@ async def get_session_memory(session_id: str):
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_session(session_id: str):
     db = get_db()
+    if not ObjectId.is_valid(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
     result = await db.chat_sessions.delete_one({"_id": ObjectId(session_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Session not found")
