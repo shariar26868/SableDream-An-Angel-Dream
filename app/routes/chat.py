@@ -4,6 +4,7 @@ from app.models.chat import (
     ChatRequest, ChatResponse,
     ConversationDetail,
     MessageRole,
+    UsageResponse,
 )
 from app.services.sable_ai import (
     get_sable_response,
@@ -74,7 +75,7 @@ async def send_message(request: ChatRequest):
         for m in raw_history
     ]
 
-    extracted, sable_reply = await asyncio.gather(
+    (extracted, extraction_usage), (sable_reply, sable_usage) = await asyncio.gather(
         extract_memory(request.message),
         get_sable_response(
             user_message=request.message,
@@ -116,6 +117,21 @@ async def send_message(request: ChatRequest):
         },
     )
 
+    await db.user_usage.update_one(
+        {"user_id": request.user_id},
+        {
+            "$inc": {
+                "total_tokens": extraction_usage.total_tokens + sable_usage.total_tokens,
+                "prompt_tokens": extraction_usage.prompt_tokens + sable_usage.prompt_tokens,
+                "completion_tokens": extraction_usage.completion_tokens + sable_usage.completion_tokens,
+                "requests_count": 1,
+            },
+            "$set": {"updated_at": now},
+            "$setOnInsert": {"user_id": request.user_id, "created_at": now},
+        },
+        upsert=True,
+    )
+
     return ChatResponse(
         user_id=request.user_id,
         reply=sable_reply,
@@ -155,6 +171,23 @@ async def get_memory(user_id: str):
 
 
 # ── DELETE /chat/history/{user_id} ───────────────────────────────────────────
+# ── GET /chat/usage/{user_id} ───────────────────────────────────────────────────────
+@router.get("/usage/{user_id}", response_model=UsageResponse)
+async def get_usage(user_id: str):
+    db = get_db()
+    usage = await db.user_usage.find_one({"user_id": user_id})
+    if not usage:
+        raise HTTPException(status_code=404, detail="No usage record found for this user")
+
+    return UsageResponse(
+        user_id=usage["user_id"],
+        total_tokens=usage.get("total_tokens", 0),
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        requests_count=usage.get("requests_count", 0),
+        updated_at=usage["updated_at"],
+    )
+
 @router.delete("/history/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_history(user_id: str):
     """Delete a user's full conversation history and memory."""

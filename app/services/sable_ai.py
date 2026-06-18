@@ -1,10 +1,32 @@
 import json
 from openai import AsyncOpenAI
 from app.config import settings
-from app.models.chat import ExtractedMemory
-from typing import List, Dict, Optional
+from app.models.chat import ExtractedMemory, UsageDetail
+from typing import List, Dict, Optional, Tuple
 
 client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def _usage_from_response(response) -> UsageDetail:
+    if not response:
+        return UsageDetail()
+
+    usage = getattr(response, "usage", response)
+    if usage is None:
+        return UsageDetail()
+
+    if isinstance(usage, dict):
+        return UsageDetail(
+            total_tokens=usage.get("total_tokens", 0),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
+
+    return UsageDetail(
+        total_tokens=getattr(usage, "total_tokens", 0) or 0,
+        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+    )
 
 # ── Sable's core personality ───────────────────────────────────────────────────
 SABLE_SYSTEM_PROMPT = """You are Sable — a warm, deeply caring AI companion. Think of yourself as a best friend who genuinely listens, never judges, and always remembers.
@@ -97,7 +119,7 @@ def _build_memory_context(user_memory: dict, user_name: str) -> str:
     return "\n".join(lines)
 
 
-async def extract_memory(user_message: str) -> ExtractedMemory:
+async def extract_memory(user_message: str) -> Tuple[ExtractedMemory, UsageDetail]:
     """
     Silently extract structured memory from a user message using GPT-4o-mini.
     Fast and cheap — runs in parallel with the main response.
@@ -114,10 +136,11 @@ async def extract_memory(user_message: str) -> ExtractedMemory:
             response_format={"type": "json_object"},
         )
         data = json.loads(response.choices[0].message.content)
-        return ExtractedMemory(**data)
+        extracted = ExtractedMemory(**data)
+        return extracted, _usage_from_response(response)
     except Exception:
         # Never let extraction failure break the chat
-        return ExtractedMemory()
+        return ExtractedMemory(), UsageDetail()
 
 
 async def get_sable_response(
@@ -125,7 +148,7 @@ async def get_sable_response(
     conversation_history: List[Dict[str, str]],
     user_name: str,
     user_memory: dict,
-) -> str:
+) -> Tuple[str, UsageDetail]:
     """
     Get Sable's reply. Injects the user's full memory as context.
     conversation_history: [{"role": "user"/"assistant", "content": "..."}]
@@ -153,7 +176,7 @@ async def get_sable_response(
         frequency_penalty=0.2,
     )
 
-    return response.choices[0].message.content
+    return response.choices[0].message.content, _usage_from_response(response)
 
 
 

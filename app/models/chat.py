@@ -38,6 +38,21 @@ class ChatResponse(BaseModel):
     timestamp: datetime
 
 
+class UsageDetail(BaseModel):
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class UsageResponse(BaseModel):
+    user_id: str
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    requests_count: int = 0
+    updated_at: datetime
+
+
 class ConversationDetail(BaseModel):
     user_id: str
     messages: List[Message] = []
